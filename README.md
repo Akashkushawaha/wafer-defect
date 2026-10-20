@@ -1,8 +1,17 @@
 # wafer-defect
 
+[![tests](https://github.com/Akashkushawaha/wafer-defect/actions/workflows/tests.yml/badge.svg)](https://github.com/Akashkushawaha/wafer-defect/actions/workflows/tests.yml)
+
 Classifying wafer-map failure patterns on **WM-811K** (811,457 real wafer maps
-from 46,393 production lots), and saying what each pattern points at on the
+from 46,293 production lots), and saying what each pattern points at on the
 fab floor.
+
+**Result:** macro F1 **0.83** across 9 classes on 34,601 wafers from lots the
+model never saw — Edge-Ring 0.98, Center 0.88, Near-full 0.93 — from 68
+hand-built features and a gradient-boosted model that trains in minutes on a
+laptop CPU. [Details below](#results).
+
+![Real WM-811K wafer maps, five per class](results/examples.png)
 
 A wafer map is the result of electrically testing every die on a wafer: pass
 or fail, laid out where the die sat. When failures are random, that's normal
@@ -12,19 +21,19 @@ shape says which part of the process to look at. This project classifies the
 shape and then names the first suspects.
 
 ```
-$ wafer predict artifacts/model.joblib LSWMD.pkl --lot lot1 --wafer 7
-lot lot1 wafer 7  (tagged: Edge-Ring)
-  Edge-Ring  0.94
-  Edge-Loc   0.04
-  Loc        0.01
+$ wafer predict artifacts/model.joblib data/LSWMD.pkl --lot lot2557 --wafer 23
+lot lot2557 wafer 23  (tagged: Scratch)
+  Scratch    0.97
+  none       0.02
+  Edge-Loc   0.00
 
-Edge-Ring: Failures all the way round the wafer edge.
+Scratch: A thin linear or arc-shaped trail of failures.
 first suspects:
-  - Edge exclusion effects: film roll-off, edge-bead removal, etch-rate change at the edge
-  - Lithography focus or exposure drift near the edge; wafer bow
-check next: Check edge-die metrology and edge-bead / bevel-clean steps; a full ring means a rotationally symmetric cause.
+  - Mechanical scratching, classically CMP (pad debris, agglomerated slurry particles)
+  - Wafer handling or transfer damage
+check next: Check CMP consumables and pad conditioning for the lot; arcs that follow the polish path are a strong CMP signal.
 ```
-<sub>Output format shown; numbers depend on your trained model.</sub>
+<sub>A real wafer from a lot held out of training.</sub>
 
 ## Approach
 
@@ -46,17 +55,18 @@ Two deliberate changes from the paper:
 
 1. **Every feature is size-normalised.** Maps range from 6×21 to 300×202 dies.
    Raw counts would teach the model die size, not pattern.
-2. **A radial profile block.** Center, Donut and Edge-Ring differ almost only
-   in *which radius* fails — and radius is where process physics shows up
-   (spin-coating, CMP pressure zones, edge effects are all radial).
+2. **A radial profile block.** Center, Donut and Edge-Ring differ mainly in
+   *which radius* fails — and radius is where process physics shows up
+   (spin-coating, CMP pressure zones, edge effects are all radial). It adds
+   +0.018 macro F1; see the ablation below.
 
 ### Evaluation choices that matter
 
 - **Lot-aware split (default).** Wafers in a lot run through the same tools
-  together and share defects. A random split puts near-duplicates on both
-  sides and inflates the score. `--split lot` keeps each lot on one side;
-  `--split official` uses the dataset's tags; `--split random` exists to show
-  the difference.
+  together and can share defects, so a random split risks near-duplicates on
+  both sides. `--split lot` keeps each lot on one side; `--split official`
+  uses the dataset's own tags; `--split random` is there to measure the
+  difference (on WM-811K it turned out to be negligible — see Results).
 - **Macro F1 is the headline, not accuracy.** ~85% of tagged maps are `none`,
   so predicting `none` every time scores ~85% accuracy and is useless.
 - **Class weighting** throughout, because Near-full is ~0.1% of the data.
@@ -105,9 +115,66 @@ Add `--limit 20000` to `featurize` for a quick first run.
 
 ## Results
 
-*To be filled in from `reports/` after training on WM-811K: macro F1 and
-per-class recall on the lot split, the confusion matrix, and the gap between
-lot-aware and random splits.*
+All 172,950 tagged maps, 68 features, `HistGradientBoostingClassifier` with
+balanced class weights. Feature extraction takes ~8 min on 2 CPU cores;
+training ~2 min.
+
+| Split | Train / test | Macro F1 | Balanced acc. |
+|---|---|---|---|
+| **Lot-aware** (default, 5-fold stratified-group, one fold held out) | 138,349 / 34,601 | **0.828** | 0.897 |
+| Random stratified | 138,360 / 34,590 | 0.826 | 0.904 |
+| Dataset's official Training/Test tags | 54,355 / 118,595 | 0.658 | 0.745 |
+
+Per class, lot-aware split:
+
+| Class | Precision | Recall | F1 | Test wafers |
+|---|---|---|---|---|
+| Edge-Ring | 0.98 | 0.98 | **0.98** | 1,936 |
+| none | 1.00 | 0.96 | 0.98 | 29,498 |
+| Near-full | 0.93 | 0.93 | 0.93 | 30 |
+| Center | 0.83 | 0.95 | 0.88 | 859 |
+| Random | 0.85 | 0.89 | 0.87 | 173 |
+| Donut | 0.87 | 0.86 | 0.86 | 111 |
+| Edge-Loc | 0.61 | 0.90 | 0.73 | 1,038 |
+| Loc | 0.53 | 0.80 | 0.64 | 718 |
+| Scratch | 0.45 | 0.81 | 0.57 | 238 |
+
+![Confusion matrix, lot-aware split](results/confusion_lot.png)
+
+**What the numbers say**
+
+- **Radially defined patterns are solved; local ones are not.** Edge-Ring,
+  Center and Donut are defined by *where on the radius* failures sit, and the
+  model separates them well. Loc, Edge-Loc and Scratch are small, irregular
+  clusters, mostly confused with each other (10% of Loc is called Edge-Loc) —
+  a boundary that is partly a labelling judgement in the dataset itself.
+- **Recall is high, precision is lower, by design.** Balanced class weights
+  make the model flag a defect pattern rather than miss it: Scratch recall is
+  0.81 at 0.45 precision. In a fab a missed excursion costs far more than a
+  second look, but the trade-off is a tunable choice, not a fixed property.
+- **Lot leakage was negligible here.** Lot-aware and random splits score the
+  same (0.828 vs 0.826). Worth checking, and good to know — but the lot split
+  stays the default because it is the honest one for new production lots.
+- **Distribution shift is the real risk.** The dataset's own "Training" set
+  is enriched with defects (Edge-Ring is 15.7% of it vs 0.9% of "Test") and a
+  third the size. On that split macro F1 falls to 0.66, mostly through
+  precision. A model deployed into a period with a different defect mix
+  needs recalibrating, and that gap — not the headline number — is what a
+  production deployment would have to manage.
+
+**Ablation — what each feature block contributes** (lot split, F1):
+
+| Features | Macro F1 | Center | Donut | Edge-Ring | Scratch |
+|---|---|---|---|---|---|
+| All 68 | **0.828** | 0.884 | 0.864 | 0.980 | 0.574 |
+| without radial profile (63) | 0.810 | 0.877 | 0.853 | 0.976 | 0.513 |
+| without Radon transform (28) | 0.788 | 0.827 | 0.821 | 0.978 | 0.480 |
+
+The Radon block is the biggest single contributor, mostly through Scratch
+and Center. The radial profile helps less than expected (+0.018): the zone
+densities already carry much of the radial information.
+
+Raw metrics: [`results/`](results/). Reproduce with the commands above.
 
 ## Engineering notes
 
